@@ -90,9 +90,6 @@ jobs:
           HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
           HTTP_PROXY:  ${{ secrets.HTTP_PROXY }}
           ALL_PROXY:   ${{ secrets.ALL_PROXY }}
-          https_proxy: ${{ secrets.HTTPS_PROXY }}
-          http_proxy:  ${{ secrets.HTTP_PROXY }}
-          all_proxy:   ${{ secrets.ALL_PROXY }}
         run: |
           # Small random pre-jitter so we don't hammer sources on the tick
           # boundary — 0..60s randomized inside the run.
