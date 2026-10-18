@@ -1,17 +1,23 @@
-"""Reddit source — polls the public Atom feed for one or more subreddits.
+"""Reddit source — reads the newest posts across one or more subreddits.
 
-## Why RSS and not the JSON API
+## Two paths: OAuth (preferred) and the public Atom feed (fallback)
 
-In late 2023 Reddit tightened access to their public JSON endpoints
-(``/r/xxx/.json``): unauthenticated requests now uniformly return 403,
-regardless of User-Agent. The public Atom feed at ``/r/xxx/new.rss`` is
-still open — Reddit intends it to be consumed by feed readers, no OAuth
-required — and is what every free monitor uses in 2026.
+Reddit now 403s its anonymous endpoints (both ``/r/xxx/.json`` and, as of
+2026, ``/r/xxx/new.rss``) from datacenter/cloud IP ranges — including the
+Azure pool GitHub Actions runs on. A descriptive User-Agent no longer
+helps: the block is at the IP-reputation layer.
 
-Rate limits are per-UA-per-IP. A descriptive, unique User-Agent (Reddit's
-recommended format is ``<platform>:<app-id>:<version> (by /u/<name>)`` but
-any distinct string works) drops us into the polite bucket rather than
-the anonymous-browser bucket, which gets 429'd almost immediately.
+The fix is Reddit's *authenticated* API. When ``REDDIT_CLIENT_ID`` and
+``REDDIT_CLIENT_SECRET`` are set (env or sources.yaml options), this source
+uses the application-only client-credentials grant to get a bearer token
+and reads ``https://oauth.reddit.com/r/a+b+c/new`` (JSON). Authenticated
+requests are rate-limited per OAuth client (100 QPM), NOT per IP, so this
+works from CI with no proxy. Create a free "script" app at
+https://www.reddit.com/prefs/apps to get the id/secret.
+
+Without credentials we fall back to the public Atom feed at
+``/r/a+b+c/new.rss`` — still fine from a residential IP or behind a clean
+proxy, just not from GitHub's runners.
 
 ## Multi-sub combined feed
 
@@ -35,6 +41,7 @@ we catch signal from all four without paying 4x request cost.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -55,6 +62,23 @@ DEFAULT_SUBREDDITS = [
     "pokemongoing",
 ]
 DEFAULT_LIMIT = 25
+
+# --- OAuth (authenticated API) ----------------------------------------------
+#
+# The anonymous .rss / .json endpoints now 403 from datacenter/cloud IP
+# ranges (including GitHub Actions' Azure pool). Reddit's *authenticated*
+# API is the sanctioned path and is rate-limited per OAuth client (100
+# QPM) rather than per IP, so it works from CI without a proxy.
+#
+# We use the "application-only" client-credentials grant: a confidential
+# ("script" or "web app") client needs only a client_id + secret, no user
+# password, and gets read access to public listings — exactly what we need.
+# Set REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET (env or sources.yaml options)
+# to switch this source onto the OAuth path automatically.
+OAUTH_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
+OAUTH_API_BASE = "https://oauth.reddit.com"
+# Refresh a little before the real expiry so a token never dies mid-request.
+OAUTH_EXPIRY_BUFFER = timedelta(seconds=60)
 
 # Cooldown when Reddit sends us a 429 or 403. Both signal "back off on this
 # UA/IP for a while"; 15 min is enough to clear their sliding window.
@@ -146,10 +170,23 @@ class RedditSource(Source):
             log.warning("[%s] no subreddits configured; nothing to fetch", self.id)
             return []
 
-        # Reddit's built-in multi-sub feed: /r/a+b+c/new.rss returns the
-        # newest posts across all named subs in ONE request. Single-sub
-        # setups collapse cleanly to /r/a/new.rss.
+        # Reddit's built-in multi-sub feed: /r/a+b+c/... returns the newest
+        # posts across all named subs in ONE request. Single-sub setups
+        # collapse cleanly to /r/a/...
         combined = "+".join(subs)
+
+        # Prefer the authenticated API when credentials are configured — it's
+        # the only path that works from cloud IPs. Fall back to the public
+        # Atom feed otherwise (works from residential IPs / behind a proxy).
+        if self._oauth_creds():
+            return self._fetch_oauth(ctx, combined, limit, keyword_hint)
+        return self._fetch_rss(ctx, combined, limit, keyword_hint)
+
+    # --- RSS path (public Atom feed, anonymous) ------------------------------
+
+    def _fetch_rss(
+        self, ctx: SourceContext, combined: str, limit: int, keyword_hint: list[str]
+    ) -> list[DropEvent]:
         url = f"https://www.reddit.com/r/{combined}/new.rss?limit={limit}"
 
         resp = self._get(url, ctx)
@@ -256,6 +293,165 @@ class RedditSource(Source):
         except httpx.HTTPError as exc:
             log.warning("[%s] reddit fetch failed for %s: %s", self.id, url, exc)
             return None
+
+    # --- OAuth path (authenticated JSON API) ---------------------------------
+
+    def _oauth_creds(self) -> tuple[str, str] | None:
+        """(client_id, client_secret) from sources.yaml options or env, or None.
+
+        Options win over env so a per-source override is possible, but the
+        normal case is the two REDDIT_* secrets injected by the workflow."""
+        cid = (self.options.get("client_id") or os.environ.get("REDDIT_CLIENT_ID") or "").strip()
+        csec = (self.options.get("client_secret") or os.environ.get("REDDIT_CLIENT_SECRET") or "").strip()
+        return (cid, csec) if cid and csec else None
+
+    def _get_token(self, ctx: SourceContext) -> str | None:
+        """Return a valid app-only bearer token, reusing a cached one from
+        state until it nears expiry. Returns None on failure (caller logs)."""
+        meta = ctx.state.source_meta.setdefault(self.id, {})
+        now = datetime.now(tz=timezone.utc)
+
+        cached = meta.get("oauth_token")
+        expiry_raw = meta.get("oauth_expiry")
+        if cached and expiry_raw:
+            try:
+                if dateparser.parse(expiry_raw) > now:
+                    return cached
+            except (ValueError, TypeError):
+                pass  # corrupt expiry -> fetch a fresh token
+
+        creds = self._oauth_creds()
+        if not creds:
+            return None
+        try:
+            resp = httpx.post(
+                OAUTH_TOKEN_URL,
+                auth=creds,  # HTTP Basic (client_id, client_secret)
+                data={"grant_type": "client_credentials"},
+                headers={"User-Agent": ctx.user_agent},
+                timeout=ctx.timeout_s,
+            )
+        except httpx.HTTPError as exc:
+            log.warning("[%s] reddit token request failed: %s", self.id, exc)
+            return None
+
+        if resp.status_code != 200:
+            log.warning(
+                "[%s] reddit token endpoint returned HTTP %s (check client id/secret)",
+                self.id, resp.status_code,
+            )
+            return None
+
+        try:
+            payload = resp.json()
+        except ValueError:
+            log.warning("[%s] reddit token response was not JSON", self.id)
+            return None
+
+        token = payload.get("access_token")
+        if not token:
+            log.warning("[%s] reddit token response had no access_token", self.id)
+            return None
+
+        expires_in = int(payload.get("expires_in", 3600))
+        meta["oauth_token"] = token
+        meta["oauth_expiry"] = (
+            now + timedelta(seconds=expires_in) - OAUTH_EXPIRY_BUFFER
+        ).isoformat()
+        log.info("[%s] obtained reddit app-only token (expires_in=%ss)", self.id, expires_in)
+        return token
+
+    def _fetch_oauth(
+        self, ctx: SourceContext, combined: str, limit: int, keyword_hint: list[str]
+    ) -> list[DropEvent]:
+        token = self._get_token(ctx)
+        if token is None:
+            return []
+
+        url = f"{OAUTH_API_BASE}/r/{combined}/new?limit={limit}&raw_json=1"
+        headers = {"User-Agent": ctx.user_agent, "Authorization": f"bearer {token}"}
+
+        try:
+            resp = httpx.get(url, headers=headers, timeout=ctx.timeout_s, follow_redirects=True)
+            # A 401 means our cached token went stale early — drop it and retry once.
+            if resp.status_code == 401:
+                ctx.state.source_meta.setdefault(self.id, {}).pop("oauth_token", None)
+                token = self._get_token(ctx)
+                if token is None:
+                    return []
+                headers["Authorization"] = f"bearer {token}"
+                resp = httpx.get(url, headers=headers, timeout=ctx.timeout_s, follow_redirects=True)
+        except httpx.HTTPError as exc:
+            log.warning("[%s] reddit oauth fetch failed: %s", self.id, exc)
+            return []
+
+        if resp.status_code in (429, 403):
+            log.warning(
+                "[%s] reddit oauth returned HTTP %s; cooling down %s",
+                self.id, resp.status_code, RATE_LIMIT_COOLDOWN,
+            )
+            ctx.state.set_cooldown(self.id, datetime.now(tz=timezone.utc) + RATE_LIMIT_COOLDOWN)
+            return []
+        if resp.status_code != 200:
+            log.warning("[%s] reddit oauth returned HTTP %s", self.id, resp.status_code)
+            return []
+
+        try:
+            children = resp.json().get("data", {}).get("children", [])
+        except ValueError:
+            log.warning("[%s] reddit oauth response was not JSON", self.id)
+            return []
+
+        meta = ctx.state.source_meta.setdefault(self.id, {})
+        last_seen_id = meta.get("last_id_combined")
+        first_new_id: str | None = None
+
+        events: list[DropEvent] = []
+        for child in children:
+            post = child.get("data", {}) or {}
+            entry_id = post.get("name") or ""  # fullname, e.g. t3_abc123
+            if entry_id and entry_id == last_seen_id:
+                break
+            if first_new_id is None and entry_id:
+                first_new_id = entry_id
+
+            title = (post.get("title") or "").strip()
+            if not title:
+                continue
+            if keyword_hint and not any(k in title.lower() for k in keyword_hint):
+                continue
+
+            permalink = post.get("permalink") or ""
+            link = f"https://www.reddit.com{permalink}" if permalink else (post.get("url") or "")
+            sub_name = post.get("subreddit") or ""
+            created = post.get("created_utc")
+            when = (
+                datetime.fromtimestamp(float(created), tz=timezone.utc)
+                if created is not None
+                else datetime.now(tz=timezone.utc)
+            )
+
+            if _is_noise(title):
+                kind, retailer = "news", "unknown"
+            else:
+                kind, retailer = _infer_kind(title), _infer_retailer(title)
+
+            events.append(
+                DropEvent(
+                    source=self.id,
+                    title=title,
+                    url=link,
+                    detected_at=when,
+                    kind=kind,
+                    region="US",
+                    retailer=retailer,
+                    raw={"subreddit": sub_name, "id": entry_id},
+                )
+            )
+
+        if first_new_id:
+            meta["last_id_combined"] = first_new_id
+        return events
 
 
 def _extract_subreddit(entry: Any) -> str | None:

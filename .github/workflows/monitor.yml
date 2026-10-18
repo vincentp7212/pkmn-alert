@@ -82,14 +82,14 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           # Add your own here and reference via ${VAR} in subscribers.yaml.
           #
-          # Route all source requests through a residential proxy so Reddit /
-          # pokemoncenter see a trusted IP instead of GitHub's (Azure) range,
-          # which both now hard-block with HTTP 403. httpx and curl_cffi both
-          # honor these env vars automatically. Scoped to this step only so the
-          # git-commit step below is not proxied.
-          HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
-          HTTP_PROXY:  ${{ secrets.HTTP_PROXY }}
-          ALL_PROXY:   ${{ secrets.ALL_PROXY }}
+          # Reddit authenticated API. The anonymous .rss/.json feeds 403 from
+          # GitHub's (Azure) IP range; the OAuth API is rate-limited per client
+          # instead of per IP, so it works from CI with no proxy. Create a free
+          # "script" app at https://www.reddit.com/prefs/apps and store the id
+          # and secret as these two Actions secrets. The reddit source switches
+          # to OAuth automatically whenever both are present.
+          REDDIT_CLIENT_ID:     ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
         run: |
           # Small random pre-jitter so we don't hammer sources on the tick
           # boundary — 0..60s randomized inside the run.
