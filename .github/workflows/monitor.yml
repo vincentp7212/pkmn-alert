@@ -69,39 +69,6 @@ jobs:
             pip install -r requirements-queueit.txt
           fi
 
-      - name: Proxy check (temporary diagnostic)
-        env:
-          HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
-          ALL_PROXY:   ${{ secrets.ALL_PROXY }}
-        run: |
-          echo "HTTPS_PROXY set? length=${#HTTPS_PROXY}"
-          python - <<'PY'
-          import os, httpx
-          print("env HTTPS_PROXY present:", bool(os.environ.get("HTTPS_PROXY")))
-          ua = ("pkmn-alert/0.1 (+https://github.com/example/pokemon-drop-alert) "
-                "python-httpx/0.27 for personal restock notifications")
-          url = "https://www.reddit.com/r/PokemonRestocks+PKMNTCGDeals/new.rss?limit=25"
-          try:
-              print("exit IP:", httpx.get("https://api.ipify.org", timeout=25).text)
-          except Exception as e:
-              print("ipify error:", repr(e))
-          # default trust_env (mirror reddit source)
-          try:
-              r = httpx.get(url, headers={"User-Agent": ua,
-                  "Accept": "application/atom+xml, application/rss+xml, application/xml, text/xml",
-                  "Accept-Language": "en-US,en;q=0.9"}, timeout=25, follow_redirects=True)
-              print("reddit via env-proxy:", r.status_code, len(r.content), "bytes")
-          except Exception as e:
-              print("reddit env-proxy error:", repr(e))
-          # explicit proxy= param (does NOT rely on trust_env)
-          try:
-              r = httpx.get(url, headers={"User-Agent": ua}, timeout=25,
-                  follow_redirects=True, proxy=os.environ.get("HTTPS_PROXY"))
-              print("reddit via explicit proxy=:", r.status_code, len(r.content), "bytes")
-          except Exception as e:
-              print("reddit explicit-proxy error:", repr(e))
-          PY
-
       - name: Run monitor
         env:
           # Make the src/ layout importable without a full editable install.
