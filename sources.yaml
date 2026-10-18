@@ -107,7 +107,9 @@ sources:
   ############################################################
   - id: queueit
     type: queueit
-    enabled: true
+    enabled: false   # Disabled 2026-10-18: Akamai hard-blocks (HTTP 403) from
+                     # both home and GitHub Actions IPs, so the probe never gets
+                     # through. Reddit/RSS sources carry all real coverage.
     options:
       url: "https://www.pokemoncenter.com/"
       # Confidence gate. Lower = more probes; higher = fewer probes but
