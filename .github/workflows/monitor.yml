@@ -69,6 +69,22 @@ jobs:
             pip install -r requirements-queueit.txt
           fi
 
+      - name: Proxy check (temporary diagnostic)
+        env:
+          HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
+          ALL_PROXY:   ${{ secrets.ALL_PROXY }}
+        run: |
+          echo "HTTPS_PROXY set? length=${#HTTPS_PROXY}"
+          python - <<'PY'
+          import os, httpx
+          print("env HTTPS_PROXY present:", bool(os.environ.get("HTTPS_PROXY")))
+          try:
+              ip = httpx.get("https://api.ipify.org", timeout=25).text
+              print("httpx exit IP:", ip)
+          except Exception as e:
+              print("httpx error:", repr(e))
+          PY
+
       - name: Run monitor
         env:
           # Make the src/ layout importable without a full editable install.
