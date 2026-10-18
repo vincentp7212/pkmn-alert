@@ -1,0 +1,50 @@
+name: probe-test
+
+# TEMPORARY diagnostic: fires one real request at pokemoncenter.com from a
+# GitHub Actions runner (fresh IP) to confirm the queueit detector can get
+# through Akamai. Delete after use.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install curl_cffi
+        run: pip install curl_cffi==0.7.4
+      - name: Probe pokemoncenter.com
+        run: |
+          python - <<'PY'
+          import random
+          from curl_cffi import requests as curl_requests
+          URL = "https://www.pokemoncenter.com/"
+          SIG = ("you're in the virtual queue","virtual queue to access pokemon center",
+                 "estimated wait time","waiting room","queue-it.net","queueit",
+                 "keep this window open to stay in the queue")
+          COOK = ("queueitaccepted","queueitunlocklink","queueitaccepted-sdfrts345e-v3")
+          imp = random.choice(["chrome124","chrome120","chrome116"])
+          print(f"Impersonating: {imp}")
+          r = curl_requests.get(URL, impersonate=imp, timeout=20, allow_redirects=True,
+              headers={"Accept-Language":"en-US,en;q=0.9","Cache-Control":"no-cache"})
+          final = str(getattr(r,"url",URL)).lower()
+          body = (r.content or b"")[:200_000].decode("utf-8","ignore").lower()
+          cookies = {getattr(c,"name","").lower() for c in r.cookies}
+          redirect = "queue-it.net" in final or "waitingroom" in final
+          cookie = any(n in cookies for n in COOK)
+          text = [s for s in SIG if s in body]
+          print(f"HTTP status: {r.status_code}")
+          print(f"Final URL:   {final}")
+          print(f"Body bytes:  {len(body)}")
+          if r.status_code in (403,412,429):
+              print(f"RESULT: BLOCKED (HTTP {r.status_code}) — even the runner IP is flagged.")
+          elif redirect or cookie or text:
+              print(f"RESULT: QUEUE DETECTED redirect={redirect} cookie={cookie} text={text}")
+          else:
+              print("RESULT: WORKING — reached site (200), normal mode, no queue live now. "
+                    "Detector would catch a real queue.")
+          PY
