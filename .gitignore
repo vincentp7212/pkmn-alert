@@ -13,3 +13,7 @@ dist/
 # Local overrides — do NOT commit real subscribers or secrets
 subscribers.local.yaml
 sources.local.yaml
+
+# Mac launchd agent uses its own dedupe cache so it does not fight the
+# committed state.json that GitHub Actions updates.
+state.local.json
