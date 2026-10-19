@@ -82,12 +82,18 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           # Add your own here and reference via ${VAR} in subscribers.yaml.
           #
-          # Reddit authenticated API. The anonymous .rss/.json feeds 403 from
-          # GitHub's (Azure) IP range; the OAuth API is rate-limited per client
-          # instead of per IP, so it works from CI with no proxy. Create a free
-          # "script" app at https://www.reddit.com/prefs/apps and store the id
-          # and secret as these two Actions secrets. The reddit source switches
-          # to OAuth automatically whenever both are present.
+          # Residential proxy pool. Reddit 403s GitHub's (Azure) IP range, so
+          # the reddit source borrows a trusted residential IP from this pool.
+          # One `host:port:user:pass` entry per line; each IP is good for ~1
+          # request before Reddit throttles it, so the source rotates through
+          # the shuffled pool and retries until one returns 200. Stored as an
+          # encrypted Actions secret — never committed to this public repo.
+          PROXY_LIST: ${{ secrets.PROXY_LIST }}
+          #
+          # Optional: Reddit authenticated API (client-credentials). If both
+          # are set the source uses OAuth instead of the proxied public feed.
+          # Creating an app now needs approval under Reddit's Responsible
+          # Builder Policy, so the proxy pool is the default path.
           REDDIT_CLIENT_ID:     ${{ secrets.REDDIT_CLIENT_ID }}
           REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
         run: |

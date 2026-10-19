@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -146,6 +147,34 @@ _NOISE_MATCHERS: list[re.Pattern[str]] = [
     re.compile(r"\bup\s+\d+\s*%", re.I),
     re.compile(r"\bdown\s+\d+\s*%", re.I),
 ]
+
+
+# --- Proxy pool --------------------------------------------------------------
+#
+# Reddit 403s datacenter IPs (GitHub's Azure range). A pool of residential
+# proxies lets us borrow a trusted IP. The list is supplied via the
+# ``PROXY_LIST`` env var (a GitHub Actions secret — never committed), one
+# ``host:port:user:pass`` entry per line (newlines, commas or spaces all work).
+# Parsed once and cached.
+_PROXY_CACHE: list[str] | None = None
+
+
+def _proxy_urls() -> list[str]:
+    global _PROXY_CACHE
+    if _PROXY_CACHE is not None:
+        return _PROXY_CACHE
+    raw = os.environ.get("PROXY_LIST", "")
+    urls: list[str] = []
+    for entry in re.split(r"[\s,]+", raw.strip()):
+        if not entry:
+            continue
+        parts = entry.split(":")
+        if len(parts) != 4:
+            continue  # skip malformed lines silently (never echo the value)
+        host, port, user, pw = parts
+        urls.append(f"http://{user}:{pw}@{host}:{port}")
+    _PROXY_CACHE = urls
+    return urls
 
 
 def _is_noise(title: str) -> bool:
@@ -275,24 +304,55 @@ class RedditSource(Source):
         return events
 
     def _get(self, url: str, ctx: SourceContext) -> httpx.Response | None:
-        try:
-            return httpx.get(
-                url,
-                headers={
-                    # Reddit-recommended format. Any unique descriptive string
-                    # works; do NOT masquerade as a browser (that gets 429'd
-                    # almost immediately since Reddit expects real browsers
-                    # to be logged in).
-                    "User-Agent": ctx.user_agent,
-                    "Accept": "application/atom+xml, application/rss+xml, application/xml, text/xml",
-                    "Accept-Language": "en-US,en;q=0.9",
-                },
-                timeout=ctx.timeout_s,
-                follow_redirects=True,
-            )
-        except httpx.HTTPError as exc:
-            log.warning("[%s] reddit fetch failed for %s: %s", self.id, url, exc)
-            return None
+        headers = {
+            # Reddit-recommended format. Any unique descriptive string
+            # works; do NOT masquerade as a browser (that gets 429'd
+            # almost immediately since Reddit expects real browsers
+            # to be logged in).
+            "User-Agent": ctx.user_agent,
+            "Accept": "application/atom+xml, application/rss+xml, application/xml, text/xml",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+
+        proxies = _proxy_urls()
+        if not proxies:
+            # No proxy pool configured — go direct (works from a residential
+            # IP; this is the local / Mac-agent path).
+            try:
+                return httpx.get(url, headers=headers, timeout=ctx.timeout_s, follow_redirects=True)
+            except httpx.HTTPError as exc:
+                log.warning("[%s] reddit fetch failed: %s", self.id, exc)
+                return None
+
+        # Proxy-pool path (cloud): each IP in the pool is a single sticky
+        # residential IP that Reddit throttles to ~1 request before 429, but
+        # a *fresh* IP returns 200. So rotate through the shuffled pool and
+        # retry on 403/429 until one lands clean. We never log the IP/creds —
+        # only an attempt counter — because GitHub only masks the exact secret
+        # blob, not individual lines printed on their own.
+        max_attempts = min(int(self.options.get("proxy_max_attempts", 6)), len(proxies))
+        order = random.sample(proxies, len(proxies))
+        last: httpx.Response | None = None
+        for i in range(max_attempts):
+            proxy = order[i]
+            try:
+                with httpx.Client(
+                    proxy=proxy, timeout=ctx.timeout_s, follow_redirects=True, trust_env=False
+                ) as client:
+                    resp = client.get(url, headers=headers)
+            except httpx.HTTPError as exc:
+                log.warning("[%s] reddit proxy attempt %d/%d failed: %s",
+                            self.id, i + 1, max_attempts, type(exc).__name__)
+                continue
+            if resp.status_code == 200:
+                if i:
+                    log.info("[%s] reddit ok via proxy attempt %d/%d", self.id, i + 1, max_attempts)
+                return resp
+            log.info("[%s] reddit proxy attempt %d/%d got HTTP %s; rotating",
+                     self.id, i + 1, max_attempts, resp.status_code)
+            last = resp
+        log.warning("[%s] all %d proxy attempts failed", self.id, max_attempts)
+        return last
 
     # --- OAuth path (authenticated JSON API) ---------------------------------
 
