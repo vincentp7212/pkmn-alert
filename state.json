@@ -1,10 +1,8 @@
 {
-  "alerted_drops": {
-    "bestbuy:restock": "2026-10-19T20:42:08.896815+00:00",
-    "pokemoncenter:news": "2026-10-19T20:42:08.896815+00:00",
-    "unknown:news": "2026-10-19T20:42:08.896815+00:00"
+  "alerted_drops": {},
+  "cooldowns": {
+    "reddit": "2026-10-20T00:11:47.488850+00:00"
   },
-  "cooldowns": {},
   "pending_reminders": [],
   "probe_burst_until": "",
   "recent_confirmations": {},
